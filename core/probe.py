@@ -34,7 +34,10 @@ def probe_video(file_path: Path) -> VideoInfo:
         )
         info = json.loads(result.stdout)
         v = next(s for s in info.get('streams', []) if s.get('codec_type') == 'video')
-        tags = info.get('format', {}).get('tags', {})
+
+        # 优先使用视频流内的 tags，再回退到 format.tags
+        tags = v.get('tags', {}) or info.get('format', {}).get('tags', {})
+
         return VideoInfo(
             v.get('width', 1920),
             v.get('height', 1080),
