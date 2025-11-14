@@ -2,6 +2,7 @@
 # coding: utf-8
 import sys, os, datetime
 from pathlib import Path
+from collections import deque
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QHBoxLayout, QVBoxLayout,
     QFileDialog, QCheckBox, QSpinBox, QTextEdit, QListWidget, QListWidgetItem,
@@ -28,8 +29,6 @@ class TextProgressBar(QProgressBar):
         self.setTextVisible(False)
         self.setMinimumHeight(26)
         self._success = None
-
-        # 呼吸动画
         self._pulse = 0.0
         self._pulse_direction = 1
         self._timer = QTimer(self)
@@ -59,13 +58,10 @@ class TextProgressBar(QProgressBar):
         rect = self.rect()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-
-        # 背景
         painter.setBrush(QColor(240, 240, 240))
         painter.setPen(QColor(180, 180, 180))
         painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
 
-        # 填充区
         progress_ratio = self.value() / 100.0
         filled_width = rect.width() * progress_ratio
         if filled_width > 0:
@@ -81,19 +77,14 @@ class TextProgressBar(QProgressBar):
             painter.drawRoundedRect(QRectF(rect.left(), rect.top(), filled_width, rect.height()).adjusted(0, 0, -0.5, 0), 6, 6)
 
         fm = QFontMetrics(self.font())
-
-        # 右侧状态文字
         status_text = f"{self.status_text} ({self.value()}%)"
         status_width = fm.horizontalAdvance(status_text) + 6
         right_rect = QRectF(rect.right() - status_width - 6, rect.top(), status_width, rect.height())
-
-        # 左侧文件名，保留扩展名
         name, ext = os.path.splitext(self.filename)
         max_name_width = rect.width() - status_width - 12
         elided_name = fm.elidedText(name, Qt.ElideRight, max_name_width - fm.horizontalAdvance(ext)) + ext
         left_rect = QRectF(6, rect.top(), max_name_width, rect.height())
 
-        # ---- 左侧文件名局部反色 ----
         overlap_left = min(left_rect.right(), filled_width) - left_rect.left()
         if overlap_left > 0:
             painter.setClipRect(QRectF(left_rect.left(), left_rect.top(), overlap_left, left_rect.height()))
@@ -105,7 +96,6 @@ class TextProgressBar(QProgressBar):
             painter.setPen(QColor(30, 30, 30))
             painter.drawText(left_rect, Qt.AlignVCenter | Qt.AlignLeft, elided_name)
 
-        # ---- 右侧状态文字局部反色 ----
         overlap_right = max(filled_width - right_rect.left(), 0)
         overlap_right = min(overlap_right, right_rect.width())
         if overlap_right > 0:
@@ -117,13 +107,10 @@ class TextProgressBar(QProgressBar):
                                        right_rect.width() - overlap_right, right_rect.height()))
             painter.setPen(QColor(30, 30, 30))
             painter.drawText(right_rect, Qt.AlignVCenter | Qt.AlignRight, status_text)
-
         painter.end()
-
 
 # --- 文件项 ---
 class FileItemWidget(QFrame):
-    """文件任务进度条 + 状态显示"""
     def __init__(self, filename: str):
         super().__init__()
         self.filename = filename
@@ -136,7 +123,6 @@ class FileItemWidget(QFrame):
                 background-color: #fafafa;
             }
         """)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         self.pb = TextProgressBar(filename)
@@ -166,7 +152,6 @@ class FileItemWidget(QFrame):
             """)
             self.pb.set_finished(False)
 
-
 # --- 主窗口 ---
 class MainWindow(QWidget):
     def __init__(self):
@@ -177,15 +162,15 @@ class MainWindow(QWidget):
         self.workers = []
         self.file_widgets = {}
         self.results = []
+        self.queue = deque()           # 待处理队列
+        self.active_workers = []       # 当前运行的 Worker
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
-
-        # 顶部版权信息
         year = datetime.datetime.now().year
         layout.addWidget(QLabel(f"© {year} uingei. All rights reserved."), alignment=Qt.AlignCenter)
 
-        # 输入输出路径
+        # 输入输出
         self.input_edit = QLineEdit()
         self.output_edit = QLineEdit()
         b_in = QPushButton("选择输入")
@@ -226,17 +211,13 @@ class MainWindow(QWidget):
         layout.addWidget(QLabel("最大并发线程"))
         layout.addWidget(self.workers_spin)
 
-        # 文件列表
+        # 文件列表 & 总体进度 & 日志
         self.file_list = QListWidget()
         layout.addWidget(self.file_list)
-
-        # 总体进度
         layout.addWidget(QLabel("总体进度"))
         self.overall_pb = QProgressBar()
         self.overall_pb.setValue(0)
         layout.addWidget(self.overall_pb)
-
-        # 日志
         layout.addWidget(QLabel("日志"))
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
@@ -251,19 +232,18 @@ class MainWindow(QWidget):
         btn_layout.addWidget(b_start)
         btn_layout.addWidget(b_stop)
         layout.addLayout(btn_layout)
+        self.setLayout(layout)
 
-    # 选择目录
     def select_dir(self, edit: QLineEdit):
         d = QFileDialog.getExistingDirectory(self, "选择目录")
         if d:
             edit.setText(d)
 
-    # 日志输出
     def append_log(self, text: str):
         self.log_edit.append(text)
         self.log_edit.ensureCursorVisible()
 
-    # 批量开始
+    # --- 批量处理 ---
     def start_batch(self):
         input_dir = Path(self.input_edit.text())
         output_dir = Path(self.output_edit.text())
@@ -275,6 +255,8 @@ class MainWindow(QWidget):
         self.file_list.clear()
         self.file_widgets.clear()
         self.results.clear()
+        self.queue.clear()
+        self.active_workers.clear()
 
         files = [f for f in input_dir.rglob("*") if f.suffix.lower() in INPUT_EXTS]
         if not files:
@@ -288,6 +270,7 @@ class MainWindow(QWidget):
             self.file_list.setItemWidget(item, widget)
             item.setSizeHint(widget.sizeHint())
             self.file_widgets[f.name] = widget
+            self.queue.append(f)
 
         debug = self.debug_cb.isChecked()
         skip_validator = self.skip_validator_cb.isChecked()
@@ -296,22 +279,25 @@ class MainWindow(QWidget):
         max_workers = self.workers_spin.value()
         self.append_log(f"[INFO] 开始处理 {len(files)} 个文件, 并发 {max_workers}")
 
-        self.workers = []
-        for f in files:
-            worker = TranscodeWorker(f, output_dir, debug, skip_validator, force_cpu, force_gpu)
-            worker.progress.connect(self.on_progress)
-            worker.finished.connect(self.on_finished)
-            worker.log.connect(self.append_log)
-            worker.start()
-            self.workers.append(worker)
+        for _ in range(min(max_workers, len(self.queue))):
+            self._start_next_worker(debug, skip_validator, force_cpu, force_gpu, output_dir)
 
-    # 停止所有任务
+    def _start_next_worker(self, debug, skip_validator, force_cpu, force_gpu, output_dir):
+        if not self.queue:
+            return
+        f = self.queue.popleft()
+        worker = TranscodeWorker(f, output_dir, debug, skip_validator, force_cpu, force_gpu)
+        worker.progress.connect(self.on_progress)
+        worker.finished.connect(self.on_finished)
+        worker.log.connect(self.append_log)
+        worker.start()
+        self.active_workers.append(worker)
+
     def stop_all(self):
-        for w in self.workers:
+        for w in self.active_workers:
             w.stop()
         self.append_log("[INFO] 已请求停止所有任务")
 
-    # 单文件进度更新
     def on_progress(self, filename: str, frame: int, total: int):
         widget = self.file_widgets.get(filename)
         if widget and widget.pb.value() < 100:
@@ -322,7 +308,6 @@ class MainWindow(QWidget):
             avg = sum(w.pb.value() for w in self.file_widgets.values()) / len(self.file_widgets)
             self.overall_pb.setValue(int(avg))
 
-    # 单文件完成
     def on_finished(self, log_entry: dict):
         filename = log_entry["file"]
         widget = self.file_widgets.get(filename)
@@ -333,13 +318,25 @@ class MainWindow(QWidget):
 
         self.results.append(log_entry)
         self.append_log(f"[INFO] 完成 {filename} — {log_entry['status']}")
-
         self.save_csv()
+
+        finished_worker = next((w for w in self.active_workers if w.file_path.name == filename), None)
+        if finished_worker:
+            self.active_workers.remove(finished_worker)
+
+        debug = self.debug_cb.isChecked()
+        skip_validator = self.skip_validator_cb.isChecked()
+        force_cpu = self.force_cpu_cb.isChecked()
+        force_gpu = self.force_gpu_cb.isChecked()
+        output_dir = Path(self.output_edit.text())
+        max_workers = self.workers_spin.value()
+        if len(self.active_workers) < max_workers:
+            self._start_next_worker(debug, skip_validator, force_cpu, force_gpu, output_dir)
+
         if self.file_widgets:
             avg = sum(w.pb.value() for w in self.file_widgets.values()) / len(self.file_widgets)
             self.overall_pb.setValue(int(avg))
 
-    # 保存 CSV
     def save_csv(self):
         import csv
         try:
@@ -349,7 +346,6 @@ class MainWindow(QWidget):
                 w.writerows(self.results)
         except Exception as e:
             self.append_log(f"[ERROR] 写 CSV 失败: {e}")
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
