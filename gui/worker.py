@@ -45,7 +45,7 @@ class TranscodeWorker(QThread):
             self.finished.emit({
                 "file": self.file_path.name,
                 "status": "FAILED",
-                "crf": None,
+                "quality": None,
                 "retries": 0,
                 "method": "UNKNOWN",
                 "hdr": False

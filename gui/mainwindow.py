@@ -344,7 +344,7 @@ class MainWindow(QWidget):
         import csv
         try:
             with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=["file", "status", "crf", "retries", "method", "hdr"])
+                w = csv.DictWriter(f, fieldnames=["file", "status", "quality", "retries", "method", "hdr"])
                 w.writeheader()
                 w.writerows(self.results)
         except Exception as e:
