@@ -16,7 +16,7 @@ from collections import OrderedDict
 from fractions import Fraction
 import math
 
-from core.probe import is_hdr, probe_media, VideoInfo
+from core.probe import probe_media, VideoInfo
 from core.utils import has_nvenc, detect_gpu_type, build_hdr_metadata
 import config
 
@@ -416,7 +416,7 @@ VIDEO_METADATA_FLAGS = ['-metadata:s:v:0', 'handler_name=VideoHandler']
 AUDIO_METADATA_FLAGS = [
     '-metadata:s:a:0', 'handler_name=SoundHandler',
     '-metadata:s:a:0', 'language=und',
-    '-metadata:s:a:0', 'title=Main Audio'
+    '-metadata:s:a:0', 'title="Main Audio"'
 ]
 
 # -------------------- Replacement: get_audio_flags --------------------
@@ -549,7 +549,7 @@ def convert_video(
     返回字典: {"file","status","crf","retries","method","hdr"}
     stop_event: 可选 threading.Event，用于外部请求取消。
     """
-    info, audio_channels = probe_media(file_path)
+    info= probe_media(file_path)
     gpu_name = detect_gpu_type()
     out_path = out_dir / (file_path.stem + '.mp4')
     hdr = info.hdr
@@ -576,7 +576,7 @@ def convert_video(
         for attempt, retry_mods in enumerate(NVENC_RETRIES + [None], 1):
             retry_vparams = adjust_nvenc_params(ff_params.vparams, attempt) if retry_mods else ff_params.vparams
             cmd = build_ffmpeg_command(
-                file_path, out_path, ff_params, audio_channels,
+                file_path, out_path, ff_params, audio_channels=info.audio_channels,
                 audio_language=info.audio_language, extra_vparams=retry_vparams
             )
             if debug:
@@ -599,7 +599,7 @@ def convert_video(
     if not use_nvenc:
         ff_params_cpu = build_ffmpeg_params(info, False, gpu_name)
         cmd_cpu = build_ffmpeg_command(
-            file_path, out_path, ff_params_cpu, audio_channels,
+            file_path, out_path, ff_params_cpu, audio_channels=info.audio_channels,
             audio_language=info.audio_language
         )
         if debug:

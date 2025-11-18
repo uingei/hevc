@@ -14,8 +14,10 @@ class VideoInfo:
     color_primaries: str
     color_transfer: str
     color_space: str
+    pix_fmt: str
     master_display: str
     max_cll: str
+    audio_channels: int
     hdr: bool = False
     audio_language: Optional[str] = 'eng'
     nb_frames: Optional[int] = None
@@ -42,19 +44,7 @@ def _get_tag(tags: dict, *keys, default=''):
             return tags[k]
     return default
 
-def is_hdr(v: dict, tags: dict) -> bool:
-    color_primaries = (v.get('color_primaries') or tags.get('COLOR_PRIMARIES', '') or tags.get('color_primaries', '')).lower()
-    color_transfer = (v.get('color_transfer') or tags.get('COLOR_TRANSFER', '') or tags.get('color_transfer', '')).lower()
-    color_space = (v.get('color_space') or tags.get('COLOR_SPACE') or tags.get('color_space', '')).lower()
-    pix_fmt = (v.get('pix_fmt') or '').lower()
-    return (
-        color_space in HDR_COLOR_SPACES or
-        color_transfer in HDR_TRANSFERS or
-        color_primaries in HDR_PRIMARIES or
-        pix_fmt in HDR_PIXFMTS
-    )
-
-def probe_media(file_path: Path) -> tuple:
+def probe_media(file_path: Path) -> VideoInfo:
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', str(file_path)],
@@ -82,6 +72,15 @@ def probe_media(file_path: Path) -> tuple:
         color_space = (v.get('color_space') or tags.get('COLOR_SPACE') or tags.get('color_space') or 'bt709').lower()
         pix_fmt = (v.get('pix_fmt') or '').lower()
 
+        # -------------------- MODIFIED: HDR 判定统一 --------------------
+        hdr_features = sum([
+            color_primaries in HDR_PRIMARIES,
+            color_transfer in HDR_TRANSFERS,
+            color_space in HDR_COLOR_SPACES,
+            pix_fmt in HDR_PIXFMTS
+        ])
+        hdr_flag = hdr_features >= 2  # 至少两个特征匹配即判定 HDR
+
         master_display = _get_tag(tags, 'master-display', 'MASTER_DISPLAY', 'master_display', 'mastering_display', default='')
         max_cll = _get_tag(tags, 'max-cll', 'MAX_CLL', 'max_cll', 'max-cll', default='')
 
@@ -93,8 +92,6 @@ def probe_media(file_path: Path) -> tuple:
         else:
             audio_lang = None
             audio_channels = 0
-
-        hdr_flag = is_hdr(v, tags)
 
         # 尝试读取帧数和时长
         nb_frames = None
@@ -108,12 +105,12 @@ def probe_media(file_path: Path) -> tuple:
         except Exception:
             duration = None
 
-        video_info = VideoInfo(
+        return VideoInfo(
             width, height, fps,
-            color_primaries, color_transfer, color_space,
-            master_display, max_cll, hdr_flag, audio_lang, nb_frames, duration
+            color_primaries, color_transfer, color_space, pix_fmt,
+            master_display, max_cll, audio_channels, hdr_flag, audio_lang, nb_frames, duration
         )
-        return video_info, audio_channels
+
     except Exception as e:
         logger.error(f"探测媒体信息失败: {file_path.name}, {e}")
-        return VideoInfo(1920, 1080, 30.0, 'bt709', 'bt709', 'bt709', '', '', False, 'eng'), 2
+        return VideoInfo(1920, 1080, 30.0, 'bt709', 'bt709', 'bt709', 'yuv420p', '', '', 2, False, 'eng', None, None)
