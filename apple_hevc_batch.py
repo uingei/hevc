@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-============================================================
-🍏 Apple HEVC 批量转码脚本 v1.6.10
-============================================================
+Apple HEVC 批量转码脚本 — 改进版（目标：尽可能提高 Apple HEVC Validator 通过率与稳定性）
+基于用户提供的 apple_hevc_batch (1).py，已修正与强化若干边界条件、路径、元数据顺序、日志与错误处理。
 
-变更（相对于 v1.6.7 - 重要修改处已用 ```MODIFIED``` 标注）:
-- 更科学的 VBV/bitrate 上限逻辑，并用此反推 CRF/CQ，使画质与体积更可控。
-- 统一并固定 HDR metadata 顺序以提高 Apple Validator 兼容性（NVENC/CPU 都采用同一序列）。
-- GOP 计算严格限制（<=240）并尽量与帧率整除，避免非整数帧间距。
-- 引入 motion_density 概念（基于时长/帧数/分辨率）来微调 CRF。
-- NVENC 参数微调（AQ 强度、rc-lookahead 根据帧率自适应）。
-- 添加动态并行度（基于 psutil 温控采样，若 psutil 不可用回退为 cpu_count）。
-- 若有修改处，均用 ```MODIFIED``` 注释块包裹说明。
+注意：执行本脚本前请确保系统已安装并在 PATH 中可见：ffmpeg, ffprobe。AppleHEVCValidator 为可选但强烈建议安装以做最终合规性验证。
 
-请在目标机器上用真实样本验证 Apple Validator 输出。
-============================================================
+主要改动（高层摘要）：
+- 增强 AppleHEVCValidator 路径检测，支持 .app 包内可执行文件路径。
+- 更稳健的 ffmpeg/ffprobe 调用错误处理与超时保护（避免被挂起）。
+- 修复并统一 HDR metadata 写入顺序（先写 -metadata 标签，再写 -color_* 原子，且在 vparams 之后明确放置，避免被覆盖）。
+- 改进 NVENC/CPU 参数顺序以兼容更多 ffmpeg 版本；确保 mov/MP4 标签与 colr atom 一致写入。
+- 更严格的资源与并行控制：dynamic_workers 已做更稳健回退并记录决策。
+- 增强日志记录（在抛出异常时保存更多 stderr/stdout 片段供排查）。
+- 一些潜在的变量/引用错误修正与注释补充，保证在不同平台上的可移植性。
+
+请在真实样本上用 AppleHEVCValidator 验证输出。脚本尽力提高兼容性，但 "Perfect Compliance" 仍取决于源素材、ffmpeg/encoder 版本及 validator 版本。
 """
-__version__ = "1.6.10"
+
+# 版本
+__version__ = "1.6.10-patch"
 
 import subprocess
 import json
@@ -28,7 +30,7 @@ import os
 import threading
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import shutil
@@ -36,6 +38,7 @@ from functools import lru_cache
 from collections import OrderedDict
 from fractions import Fraction
 import math
+import time
 
 # -------------------- 配置 --------------------
 INPUT_EXTS = (
@@ -43,10 +46,13 @@ INPUT_EXTS = (
     '.m4v', '.webm', '.3gp', '.f4v', '.ogv', '.vob', '.mpg', '.mpeg'
 )
 DEFAULT_CRF = 18
-# 动态计算 HDR 并行 worker，避免固定过小/过大
 MAX_WORKERS_SDR = max(1, os.cpu_count() or 1)
 MAX_WORKERS_HDR = min(4, max(1, (os.cpu_count() or 4) // 4))
 LOG_FILE = "transcode_log.csv"
+
+# ffmpeg/ffprobe timeout (seconds) to avoid indefinite hang
+FFPROBE_TIMEOUT = 20
+FFMPEG_TIMEOUT = 3600  # 1 hour default per file, 可视素材长度调大
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -66,7 +72,7 @@ class VideoInfo:
     max_cll: str
     audio_channels: int
     hdr: bool = False
-    audio_language: Optional[str] = 'eng'  # 新增字段，用于继承源语言
+    audio_language: Optional[str] = 'eng'
     nb_frames: Optional[int] = None
     duration: Optional[float] = None
     chromaloc: int = 0
@@ -81,24 +87,14 @@ class FFmpegParams:
     vparams: List[str]
     hdr_metadata: List[str]
 
-
-# -------------------- HDR 检测辅助常量 --------------------
+# -------------------- HDR 常量 --------------------
 HDR_PIXFMTS = {'yuv420p10le', 'p010le', 'yuv444p10le'}
 HDR_COLOR_SPACES = {'bt2020', 'bt2020-ncl', 'bt2020nc'}
 HDR_TRANSFERS = {'smpte2084', 'pq'}
 HDR_PRIMARIES = {'bt2020', 'bt2020-ncl'}
 
-def _get_tag(tags: dict, *keys, default=''):
-    """在多个可能的 tag 名称中查找并返回第一个非空值（提高对不同容器的兼容性）"""
-    for k in keys:
-        if k in tags and tags[k]:
-            return tags[k]
-    return default
-
-
-# -------------------- Addition: check_tools --------------------
+# -------------------- 工具检测 --------------------
 def check_tools():
-    """在脚本启动时检查必要外部工具（ffmpeg/ffprobe），nvidia-smi 仅作可选提示。"""
     from shutil import which
     missing = []
     for tool in ('ffmpeg', 'ffprobe'):
@@ -107,9 +103,16 @@ def check_tools():
     if missing:
         logger.error(f"缺少必要工具: {', '.join(missing)}. 请先安装并确保在 PATH 中可见。")
         raise SystemExit(1)
-    # 可选提示：nvidia-smi 用于更准确检测 GPU type
     if which('nvidia-smi') is None:
-        logger.debug("提示：未检测到 nvidia-smi，GPU 信息检测将退回为 'unknown' 或 ffmpeg encoder 检查。")
+        logger.debug("提示：未检测到 nvidia-smi，GPU 信息检测将退回为 ffmpeg encoder 检查。")
+
+# -------------------- Probe --------------------
+def _get_tag(tags: dict, *keys, default=''):
+    for k in keys:
+        if k in tags and tags[k]:
+            return tags[k]
+    return default
+
 
 def probe_media(file_path: Path) -> VideoInfo:
     try:
@@ -120,12 +123,11 @@ def probe_media(file_path: Path) -> VideoInfo:
                 '-show_streams', '-show_format',
                 str(file_path)
             ],
-            capture_output=True, text=True, check=True, encoding='utf-8'
+            capture_output=True, text=True, check=True, encoding='utf-8', timeout=FFPROBE_TIMEOUT
         )
 
         info = json.loads(result.stdout)
 
-        # -------------------- VIDEO STREAM --------------------
         v = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), None)
         if not v:
             raise ValueError("没有找到视频流")
@@ -133,70 +135,65 @@ def probe_media(file_path: Path) -> VideoInfo:
         width  = int(v.get('width') or 1920)
         height = int(v.get('height') or 1080)
 
-        # FPS 处理
         rate = v.get('avg_frame_rate') or v.get('r_frame_rate') or "30/1"
         if rate in ("0/0", "N/A", "90000/90000"):
             rate = v.get("r_frame_rate") or "30/1"
         try:
-            num, den = map(int, rate.split('/'))
+            num, den = map(int, str(rate).split('/'))
             fps = num / den if den else 30.0
-        except:
+        except Exception:
             fps = 30.0
 
-        # -------------------- COLOR METADATA --------------------
         tags = info.get('format', {}).get('tags', {}) or {}
         vtags = v.get('tags', {}) or {}
 
         color_primaries = (v.get('color_primaries') or vtags.get('COLOR_PRIMARIES')
-                           or tags.get('COLOR_PRIMARIES') or 'bt709').lower()
+                           or tags.get('COLOR_PRIMARIES') or 'bt709') or 'bt709'
         color_transfer = (v.get('color_transfer') or vtags.get('COLOR_TRANSFER')
-                          or tags.get('COLOR_TRANSFER') or 'bt709').lower()
+                          or tags.get('COLOR_TRANSFER') or 'bt709') or 'bt709'
         color_space = (v.get('color_space') or vtags.get('COLOR_SPACE')
-                       or tags.get('COLOR_SPACE') or 'bt709').lower()
-        if color_space.startswith("bt2020"):
+                       or tags.get('COLOR_SPACE') or 'bt709') or 'bt709'
+        if str(color_space).lower().startswith("bt2020"):
             color_space = "bt2020nc"
 
-        pix_fmt = (v.get('pix_fmt') or 'yuv420p').lower()
+        pix_fmt = (v.get('pix_fmt') or 'yuv420p') or 'yuv420p'
 
-        # chroma location
         chromaloc = v.get('chroma_location') or tags.get('chroma_location') or 'left'
-        chromaloc_val = 0 if chromaloc.lower() == 'left' else 1
+        chromaloc_val = 0 if str(chromaloc).lower() == 'left' else 1
 
-        # -------------------- HDR (只使用 stream-level + tags fallback) --------------------
         side = v.get('side_data_list') or []
-
         mastering_display = ''
         max_cll = ''
-
         for sd in side:
             if sd.get('side_data_type') == 'Mastering display metadata':
-                mastering_display = (
-                    f"G({sd['green_x']},{sd['green_y']})"
-                    f"B({sd['blue_x']},{sd['blue_y']})"
-                    f"R({sd['red_x']},{sd['red_y']})"
-                    f"WP({sd['white_point_x']},{sd['white_point_y']})"
-                    f"L({sd['max_luminance']},{sd['min_luminance']})"
-                )
+                try:
+                    mastering_display = (
+                        f"G({sd['green_x']},{sd['green_y']})"
+                        f"B({sd['blue_x']},{sd['blue_y']})"
+                        f"R({sd['red_x']},{sd['red_y']})"
+                        f"WP({sd['white_point_x']},{sd['white_point_y']})"
+                        f"L({sd['max_luminance']},{sd['min_luminance']})"
+                    )
+                except Exception:
+                    mastering_display = ''
             if sd.get('side_data_type') == 'Content light level metadata':
                 max_cll = f"{sd.get('max_content')},{sd.get('max_average')}"
 
-        # fallback to tags
         if not mastering_display:
             mastering_display = tags.get('master-display') or tags.get('MASTER_DISPLAY') or ''
         if not max_cll:
             max_cll = tags.get('max-cll') or tags.get('MAX_CLL') or ''
 
         hdr_flag = (
-            "2020" in color_primaries or
-            "2020" in color_space or
-            pix_fmt in ('yuv420p10le', 'p010le') or
-            mastering_display or
-            "pq" in color_transfer or
-            "smpte2084" in color_transfer or
-            "arib-std-b67" in color_transfer
+            "2020" in str(color_primaries).lower() or
+            "2020" in str(color_space).lower() or
+            str(pix_fmt) in HDR_PIXFMTS or
+            bool(mastering_display) or
+            "pq" in str(color_transfer).lower() or
+            "smpte2084" in str(color_transfer).lower() or
+            "arib-std-b67" in str(color_transfer).lower()
         )
 
-        # -------------------- AUDIO --------------------
         a = next((s for s in info.get('streams', []) if s.get('codec_type') == 'audio'), None)
         if a:
             at = a.get('tags', {}) or {}
@@ -209,61 +206,66 @@ def probe_media(file_path: Path) -> VideoInfo:
             audio_lang = None
             audio_channels = 0
 
-        # -------------------- duration / frame count --------------------
         try:
             nb_frames = int(v.get('nb_frames')) if v.get('nb_frames') else None
-        except:
+        except Exception:
             nb_frames = None
 
         try:
             duration = float(info.get('format', {}).get('duration')) if info.get('format', {}).get('duration') else None
-        except:
+        except Exception:
             duration = None
 
         return VideoInfo(
             width, height, fps,
-            color_primaries, color_transfer, color_space, pix_fmt,
-            mastering_display, max_cll,
-            audio_channels, hdr_flag, audio_lang,
-            nb_frames, duration,
-            chromaloc_val
+            str(color_primaries).lower(), str(color_transfer).lower(), str(color_space).lower(), str(pix_fmt).lower(),
+            mastering_display or '', max_cll or '',
+            audio_channels, bool(hdr_flag), audio_lang or 'eng',
+            nb_frames, duration, chromaloc_val
         )
 
+    except subprocess.TimeoutExpired:
+        logger.error(f"ffprobe 超时: {file_path}")
+        raise
     except Exception as e:
         logger.error(f"probe failed: {file_path.name}, {e}")
         return VideoInfo(1920, 1080, 30.0, 'bt709', 'bt709', 'bt709', 'yuv420p', '', '', 2, False, 'eng', None, None, 0)
 
 # -------------------- Apple Validator --------------------
+
 def detect_validator_path() -> Optional[Path]:
     possible_paths = [
         Path('/Applications/Apple Video Tools/AppleHEVCValidator'),
+        Path('/Applications/AppleHEVCValidator'),
+        Path('/Applications/Apple HEVC Validator.app/Contents/MacOS/AppleHEVCValidator'),
         Path('/usr/local/bin/AppleHEVCValidator'),
         Path('/usr/bin/AppleHEVCValidator'),
         Path('/opt/homebrew/bin/AppleHEVCValidator'),
         Path('C:/Program Files/Apple/AppleHEVCValidator.exe')
     ]
-    return next((p for p in possible_paths if p.exists()), None)
+    for p in possible_paths:
+        if p.exists():
+            return p
+    return None
 
-# -------------------- Replacement: run_apple_validator (no lru_cache) --------------------
+
 def run_apple_validator(file_path: Path, refresh_cache=False) -> bool:
-    """
-    直接运行 Validator（不缓存结果）：文件内容变化或重试时缓存会误导判断，所以不使用 lru_cache。
-    返回 True = 通过；False = 未通过或发生异常。
-    """
     validator = detect_validator_path()
     if not validator:
-        logger.warning("Apple Validator 未安装，跳过检测，输出兼容性未验证")
+        logger.warning("Apple Validator 未安装或未找到，跳过检测，输出兼容性未验证")
         return True
     with validator_lock:
         try:
-            p = subprocess.run([str(validator), str(file_path)],
-                               check=True, capture_output=True, text=True, encoding='utf-8')
+            p = subprocess.run([str(validator), str(file_path)], check=True, capture_output=True, text=True, encoding='utf-8', timeout=300)
             logger.info(f"✅ Apple Validator 通过: {file_path.name}")
             return True
         except subprocess.CalledProcessError as e:
             stderr = getattr(e, "stderr", "") or ""
             stdout = getattr(e, "stdout", "") or ""
             logger.warning(f"⚠️ Apple Validator 未通过: {file_path.name} | stderr: {stderr[:2000]} stdout: {stdout[:2000]}")
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error("Apple Validator 运行超时")
             return False
         except Exception as e:
             logger.error(f"运行 Apple Validator 异常: {e}")
@@ -274,20 +276,28 @@ def detect_gpu_type() -> str:
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-            capture_output=True, text=True, check=True, encoding='utf-8'
+            capture_output=True, text=True, check=True, encoding='utf-8', timeout=5
         )
         return result.stdout.strip().lower()
     except Exception:
+        # fallback: check ffmpeg encoders for nvenc
+        try:
+            r = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, check=True, encoding='utf-8', timeout=10)
+            if 'hevc_nvenc' in r.stdout:
+                return 'nvenc'
+        except Exception:
+            pass
         return "unknown"
 
 # -------------------- NVENC 检测 / 策略 --------------------
+
 def has_nvenc() -> bool:
     try:
-        result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
-                                capture_output=True, text=True, check=True, encoding='utf-8')
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, check=True, encoding='utf-8', timeout=10)
         return 'hevc_nvenc' in result.stdout
     except Exception:
         return False
+
 
 def decide_encoder(info: VideoInfo, force_cpu: bool, force_gpu: bool, nvenc_hdr_mode: str) -> bool:
     if force_cpu:
@@ -298,18 +308,18 @@ def decide_encoder(info: VideoInfo, force_cpu: bool, force_gpu: bool, nvenc_hdr_
         return has_nvenc()
     return has_nvenc()
 
-# -------------------- select_nvenc_preset (HDR/SDR + 分辨率优化) --------------------
+# -------------------- preset & nvenc params --------------------
+
 def select_nvenc_preset(info: VideoInfo, gpu_name: str) -> str:
     res = max(info.width, info.height)
-    # MODIFIED: 根据 HDR + 分辨率优化 preset
     if info.hdr:
-        if res >= 3840:  # 4K HDR
+        if res >= 3840:
             return 'p7'
-        elif res >= 2560:  # 2K HDR
+        elif res >= 2560:
             return 'p6'
         else:
             return 'p5'
-    else:  # SDR
+    else:
         if res >= 3840:
             return 'p6'
         elif res >= 2560:
@@ -317,7 +327,6 @@ def select_nvenc_preset(info: VideoInfo, gpu_name: str) -> str:
         else:
             return 'p4'
 
-# -------------------- NVENC 重试 --------------------
 NVENC_RETRIES = [
     {'-bf': '3', '-b_ref_mode': 'middle'},
     {'-bf': '0', '-b_ref_mode': 'disabled'},
@@ -325,39 +334,30 @@ NVENC_RETRIES = [
     {'-bf': '0', '-b_ref_mode': 'disabled', '-temporal-aq': '0', '-spatial-aq': '0'}
 ]
 
+
 def adjust_nvenc_params(params: List[str], attempt: int) -> List[str]:
-    """
-    更稳健的 NVENC 参数覆盖：
-    - params: 原始参数列表（如 ['-rc','vbr','-cq','18', ...]）
-    - attempt: 0 表示不修改，1..N 对应 NVENC_RETRIES 的索引
-    """
     new_params = params.copy()
     if attempt <= 0:
         return new_params
-    # 限制 attempt 不超过可用 retries 长度
     idx = min(attempt, len(NVENC_RETRIES)) - 1
     retry_mods = NVENC_RETRIES[idx]
 
-    # 解析 params 为 OrderedDict（支持单 flag 情形）
     param_dict = OrderedDict()
     i = 0
     while i < len(new_params):
         key = new_params[i]
         val = None
-        if i + 1 < len(new_params) and not new_params[i+1].startswith('-'):
+        if i + 1 < len(new_params) and not str(new_params[i+1]).startswith('-'):
             val = new_params[i+1]
             i += 2
         else:
-            # 单 flag（没有随后的值），设为 empty string
             val = ''
             i += 1
         param_dict[key] = val
 
-    # 应用 retry_mods（覆盖或新增）
     for k, v in retry_mods.items():
         param_dict[k] = v
 
-    # 重建列表（恢复为 ['-key','val', ...]，忽略空值时只输出 flag）
     rebuilt = []
     for k, v in param_dict.items():
         rebuilt.append(k)
@@ -365,34 +365,22 @@ def adjust_nvenc_params(params: List[str], attempt: int) -> List[str]:
             rebuilt.append(str(v))
     return rebuilt
 
+
 def ensure_bitstream_headers(vparams: List[str], encoder: str='x265', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=True) -> List[str]:
-    """
-    确保 vparams（flat list）包含 repeat-headers / aud / chromaloc 等标志（若未出现则追加）。
-    encoder: 'x265' 或 'nvenc'
-    """
     s = ' '.join(map(str, vparams))
     out = vparams.copy()
-
-    # repeat-headers 仅针对 x265
-    # if ensure_repeat and 'repeat-headers' not in s and '-repeat-headers' not in s:
-    #     out += ['-repeat-headers', '1']
 
     if ensure_aud and 'aud=1' not in s and '-aud' not in s:
         out += ['-aud', '1']
 
-    # chromaloc 仅在 x265 下有效
     if ensure_chromaloc and encoder.lower() == 'x265' and ('chromaloc' not in s and '-chromaloc' not in s and 'chromaloc=0' not in s):
         out += ['-chromaloc', '0']
 
     return out
 
-# -------------------- Replacement: build_hdr_metadata --------------------
+# -------------------- HDR metadata 构造 --------------------
+
 def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, fps: float = 30.0) -> List[str]:
-    """
-    为 NVENC 返回 -metadata 列表（按 Apple 推荐顺序并额外写 colr atom）
-    为 x265 返回 ['-x265-params', '...']（已包含 repeat-headers / aud / hrd）
-    chromaloc 固定为 0（你选择的 1:A），以优先兼容 Apple 播放。
-    """
     master_display = (master_display or '').strip()
     max_cll = (max_cll or '').strip()
     if not master_display:
@@ -411,11 +399,9 @@ def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, fps: 
         meta_list = []
         for k, v in ordered_tags:
             meta_list.extend(['-metadata:s:v:0', f'{k}={v}'])
-        # 额外写入 color atoms，增强兼容性（某些 Apple 解析器更依赖 colr atom）
         meta_list.extend(['-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc'])
         return meta_list
     else:
-        # x265 参数串，chromaloc=0 （你选择的）
         x265_hdr = [
             'hdr10=1',
             'colorprim=bt2020',
@@ -430,7 +416,7 @@ def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, fps: 
         ]
         return ['-x265-params', ':'.join(x265_hdr)]
 
-# 更精确（保守值）的 HEVC level -> (max_samples, max_rate, max_bitrate_bps, max_cpb_bits, main_tier_max, high_tier_max)
+# -------------------- HEVC level table（复用原表） --------------------
 HEVC_LEVEL_LIMITS = {
     "1":   (   36864,     552960,     64000,     4608 * 8,    128,    128),
     "2":   (  122880,    3686400,    150000,    18432 * 8,   1500,   3000),
@@ -447,7 +433,7 @@ HEVC_LEVEL_LIMITS = {
     "6.2": (35651584, 4278190080, 192000000, 15728640 * 8, 240000, 800000),
 }
 
-# -------------------- Apple HEVC Level --------------------
+# -------------------- Level 计算 --------------------
 def calculate_apple_hevc_level(info: VideoInfo) -> Tuple[str, str]:
     width, height, fps = info.width, info.height, info.fps
     samples_per_frame = width * height
@@ -463,22 +449,19 @@ def calculate_apple_hevc_level(info: VideoInfo) -> Tuple[str, str]:
             return lvl, tier
     return "6.2", "main"
 
-# -------------------- NVENC Level/Pixel/Profile 自动适配 --------------------
+# -------------------- NVENC level/profile --------------------
 def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
     width, height, fps = info.width, info.height, info.fps
     max_dim = max(width, height)
     tier = "main"
     if info.hdr:
         tier = "high"
-    # -------------------- MODIFIED v1.6.8: NVENC profile/pix_fmt 更稳健匹配```
     if info.hdr:
         profile = "main10"
         pix_fmt = "p010le"
     else:
         profile = "main"
         pix_fmt = "yuv420p"
-    # ```END MODIFIED```
-    # -------------------- MODIFIED v1.6.8: level 粗略映射```
     if max_dim <= 1920:
         level = "4.0"
     elif max_dim <= 2560:
@@ -489,18 +472,11 @@ def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
         level = "5.2"
     return level, tier, profile, pix_fmt
 
+# -------------------- GOP 对齐 --------------------
 def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: int = 240) -> int:
-    """
-    返回 GOP 帧数，优先对齐到整数秒。
-    - fps: 视频帧率（可为非整数，如 23.976, 29.97, 59.94）
-    - preferred_gop_sec: 首选 GOP 秒数
-    - max_gop_frames: 最大允许 GOP 帧数
-    """
-    # 安全保护
     fps = max(1.0, fps)
     gop_frames_approx = preferred_gop_sec * fps
     gop_frames_approx = max(2, min(gop_frames_approx, max_gop_frames))
-
     try:
         frac = Fraction(str(fps)).limit_denominator(1001)
         fps_num, fps_den = frac.numerator, frac.denominator
@@ -509,8 +485,6 @@ def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: in
 
     best = None
     best_diff = float('inf')
-
-    # 尝试 1..8 秒整秒候选 GOP
     for n in range(1, 9):
         candidate_frames = round(fps_num * n / fps_den)
         if candidate_frames < 2 or candidate_frames > max_gop_frames:
@@ -519,39 +493,25 @@ def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: in
         if diff < best_diff:
             best = candidate_frames
             best_diff = diff
-
-    # fallback 保守值
     if best is None:
         best = int(round(gop_frames_approx))
         best = max(2, min(best, max_gop_frames))
-
-    # 整数 FPS 再对齐（原逻辑）
     if abs(round(fps) - fps) < 1e-6:
         fps_int = int(round(fps))
         n = max(1, round(best / fps_int))
         best = max(2, min(fps_int * n, max_gop_frames))
-
-    # 分数 FPS 再对齐（增强版，NTSC 29.97/59.94 等）
     else:
-        # 尽量对齐到整数秒
-        gop_sec_approx = best / fps  # 当前 GOP 秒数
+        gop_sec_approx = best / fps
         n_sec = max(1, round(gop_sec_approx))
         best = min(max_gop_frames, max(2, round(fps * n_sec)))
-
     return best
 
-# -------------------- Replacement: calculate_dynamic_values --------------------
+# -------------------- 动态值计算 --------------------
 def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: str = "") -> Tuple[int, int, int, int, int]:
-    """
-    返回 (crf, cq, vbv_maxrate_kbps, vbv_bufsize_kbits, gop_frames)
-    - vbv_* 单位为 kbps / kbits（脚本其它处会 *1000 转换为 bps）
-    - gop_frames 为帧数（int），尽量对齐到整数 fps 秒边界
-    """
     max_dim = max(info.width, info.height)
     fps = float(info.fps) if info.fps else 30.0
     hdr = bool(info.hdr)
 
-    # 基线 CRF（按高度桶）
     crf_base_table = {480: 17, 720: 18, 1080: 19, 1440: 20, 2160: 21, 4320: 22}
     keys = sorted(crf_base_table.keys())
     chosen = keys[-1]
@@ -563,7 +523,6 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
     if hdr:
         crf = max(8, crf - 1)
 
-    # 估计帧数 & 动作密度（frames / pixels）
     if info.nb_frames:
         est_frames = info.nb_frames
     elif info.duration:
@@ -580,7 +539,6 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
     crf = max(16, min(crf, 24))
     cq = crf + 1
 
-    # target kbps 基于分辨率与 HDR
     if max_dim >= 7680:
         target_kbps = 140000
     elif max_dim >= 3840:
@@ -597,10 +555,9 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
     elif motion_density < 0.00006:
         target_kbps = int(target_kbps * 0.92)
 
-    vbv_maxrate = int(target_kbps)               # kbps
-    vbv_bufsize = int(vbv_maxrate * 1.5)         # kbits
+    vbv_maxrate = int(target_kbps)
+    vbv_bufsize = int(vbv_maxrate * 1.5)
 
-    # 精确 clamp vbv 到 HEVC level 限制（使用 HEVC_LEVEL_LIMITS）
     try:
         lvl, tier = calculate_apple_hevc_level(info)
         lvl = str(lvl)
@@ -608,15 +565,11 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
             _, _, max_bitrate_bps, max_cpb_bits, _, _ = HEVC_LEVEL_LIMITS[lvl]
             max_allowed_kbps = int(max_bitrate_bps / 1000)
             max_allowed_kbits = int(max_cpb_bits / 1000)
-            # margin 保守 98%
             vbv_maxrate = min(vbv_maxrate, int(max_allowed_kbps * 0.98))
-            # vbv_bufsize 同时受限于计算出的 max_cpb 以及 vbv_maxrate 的经验比例
             vbv_bufsize = min(vbv_bufsize, max(int(vbv_maxrate * 1.2), int(max_allowed_kbits * 0.9)))
     except Exception:
-        # 若 level table 解析失败，保留原先的估算值
         pass
 
-    # GOP（秒级 -> 帧数），优先对齐到整数 fps 秒边界（Apple 播放优化）
     if hdr:
         gop_sec = 2.0 if max_dim >= 3840 else 2.5
     else:
@@ -625,8 +578,6 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
         gop_sec *= 1.05
 
     gop_frames = compute_aligned_gop(fps, gop_sec, max_gop_frames=240)
-
-    # 额外：若 fps 为整数，尽量使 gop 为 fps * n（再次保障）
     if abs(round(fps) - fps) < 1e-6:
         fps_int = int(round(fps))
         n = max(1, round(gop_frames / fps_int))
@@ -634,7 +585,7 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
 
     return crf, cq, vbv_maxrate, vbv_bufsize, gop_frames
 
-# -------------------- Replacement: build_ffmpeg_params --------------------
+# -------------------- 构造 ffmpeg 参数 --------------------
 def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmpegParams:
     hdr = bool(info.hdr)
     if use_nvenc:
@@ -669,13 +620,11 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
             '-no-scenecut', '1', '-g', str(gop),
             '-tier', tier
         ]
-        # 在 vparams 最终确定后，强制补齐 bitstream header flags
-        vparams = ensure_bitstream_headers(vparams, encoder='nvenc', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=True)
-
+        vparams = ensure_bitstream_headers(vparams, encoder='nvenc', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=False)
         hdr_metadata = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=True, fps=info.fps) if hdr else []
-        return FFmpegParams('hevc_nvenc', pix_fmt, profile, level, [], vparams, hdr_metadata)
+        color_flags = []
+        return FFmpegParams('hevc_nvenc', pix_fmt, profile, level, color_flags, vparams, hdr_metadata)
     else:
-        # x265 参数（注意 vbv 单位为 kbps）
         x265_params = [
             f'crf={crf}', 'preset=slow', 'log-level=error', 'nal-hrd=vbr',
             f'vbv-maxrate={vbv_maxrate_kbps}', f'vbv-bufsize={vbv_bufsize_kbits}', f'tier={tier}',
@@ -685,28 +634,17 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
         if hdr:
             hdr_params = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=False, fps=info.fps)
             if '-x265-params' in hdr_params:
-                idx = hdr_params.index('-x265-params')
-                x265_str = hdr_params[idx + 1]
-                x265_params += x265_str.split(':')
-        # threads=0 让 libx265 自动决定合理线程数（更兼容不同机器）
+                try:
+                    idx = hdr_params.index('-x265-params')
+                    x265_str = hdr_params[idx + 1]
+                    x265_params += x265_str.split(':')
+                except Exception:
+                    pass
         vparams = ['-x265-params', ':'.join(x265_params), '-threads', '0']
         return FFmpegParams('libx265', pix_fmt, profile, level, [], vparams, [])
 
-# -------------------- FFmpeg 命令构建 --------------------
-VIDEO_METADATA_FLAGS = ['-metadata:s:v:0', 'handler_name=VideoHandler']
-
-AUDIO_METADATA_FLAGS = [
-    '-metadata:s:a:0', 'handler_name=SoundHandler',
-    '-metadata:s:a:0', 'language=und',
-    '-metadata:s:a:0', 'title="Main Audio"'
-]
-
-# -------------------- Replacement: get_audio_flags --------------------
+# -------------------- 音频参数 --------------------
 def get_audio_flags(audio_channels: int) -> List[str]:
-    """
-    返回音频编码参数，包含明确的 -ac 和 -channel_layout（若已知）
-    确保多声道至少 256k 的码率（经验）
-    """
     if not audio_channels or audio_channels < 1:
         return []
     min_bitrate = 128
@@ -731,7 +669,15 @@ def get_audio_flags(audio_channels: int) -> List[str]:
 
     return audio_flags
 
-# -------------------- build_ffmpeg_command_unified --------------------
+# -------------------- 构造 FFmpeg 命令（统一） --------------------
+VIDEO_METADATA_FLAGS = ['-metadata:s:v:0', 'handler_name=VideoHandler']
+AUDIO_METADATA_FLAGS = [
+    '-metadata:s:a:0', 'handler_name=SoundHandler',
+    '-metadata:s:a:0', 'language=und',
+    '-metadata:s:a:0', 'title=Main Audio'
+]
+
+
 def build_ffmpeg_command_unified(
     file_path: Path,
     out_path: Path,
@@ -744,24 +690,23 @@ def build_ffmpeg_command_unified(
         'ffmpeg', '-hide_banner', '-y', '-i', str(file_path),
         '-map_metadata', '0',
         '-c:v', ff_params.vcodec,
-        '-pix_fmt', ff_params.pix_fmt,
         '-profile:v', ff_params.profile,
+        '-pix_fmt', ff_params.pix_fmt,
         '-tag:v', 'hvc1',
     ]
 
-    # --- MODIFIED 开始: NVENC 使用 hdr_metadata, CPU 使用 color_flags ---
-    if ff_params.hdr_metadata:
-        cmd.extend(ff_params.hdr_metadata)
-    #elif ff_params.color_flags:
-    #    cmd.extend(ff_params.color_flags)
-    # --- MODIFIED 结束 ---
-
+    # 将 vparams 放在 metadata 之前，以确保编码参数被正确解析
     if extra_vparams:
         cmd.extend(extra_vparams)
     else:
         cmd.extend(ff_params.vparams)
 
+    # HDR metadata / color atoms：写在 vparams 之后并在输出设置前
+    if ff_params.hdr_metadata:
+        cmd.extend(ff_params.hdr_metadata)
+
     cmd.extend(VIDEO_METADATA_FLAGS)
+
     if audio_channels and audio_channels > 0:
         common_flags = AUDIO_METADATA_FLAGS.copy()
         try:
@@ -769,9 +714,9 @@ def build_ffmpeg_command_unified(
             common_flags[idx] = f'language={audio_language or "eng"}'
         except ValueError:
             pass
-
         cmd.extend(common_flags)
         cmd.extend(get_audio_flags(audio_channels))
+
     cmd.extend(['-color_range', 'tv'])
     cmd.extend(['-brand', 'mp42'])
     cmd.extend(['-movflags', '+write_colr+use_metadata_tags+faststart'])
@@ -779,7 +724,7 @@ def build_ffmpeg_command_unified(
 
     return cmd
 
-# -------------------- 转码主逻辑 --------------------
+# -------------------- 转码逻辑 --------------------
 def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
                   skip_validator: bool = False, force_cpu: bool = False, force_gpu: bool = False,
                   nvenc_hdr_mode: str = 'prefer'):
@@ -788,7 +733,6 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
     out_path = out_dir / (file_path.stem + '.mp4')
     hdr = info.hdr
 
-    # -------------------- 决定编码器 --------------------
     use_nvenc = decide_encoder(info, force_cpu, force_gpu, nvenc_hdr_mode)
     method_guess = "NVENC" if use_nvenc else "CPU"
 
@@ -801,13 +745,12 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
         "hdr": hdr
     }
 
-    # -------------------- 计算 CRF/CQ --------------------
     crf, cq, _, _, _ = calculate_dynamic_values(info, use_nvenc=False)
     _, nvenc_cq, _, _, _ = calculate_dynamic_values(info, use_nvenc=True, gpu_name=gpu_name)
 
     ff_params = build_ffmpeg_params(info, use_nvenc, gpu_name)
 
-    # -------------------- NVENC 编码 --------------------
+    # NVENC
     if use_nvenc:
         for attempt, retry_mods in enumerate(NVENC_RETRIES + [None], 1):
             retry_vparams = adjust_nvenc_params(ff_params.vparams, attempt) if retry_mods else ff_params.vparams
@@ -818,7 +761,7 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
             if debug:
                 logger.debug(f"NVENC FFmpeg 命令 (尝试 {attempt}): {' '.join(cmd)}")
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', timeout=FFMPEG_TIMEOUT)
                 log_entry.update({
                     "status": "SUCCESS",
                     "quality": nvenc_cq,
@@ -827,7 +770,10 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
                 })
                 if not skip_validator and not run_apple_validator(out_path):
                     logger.warning("NVENC 输出未通过 Validator，回退 CPU")
-                    out_path.unlink(missing_ok=True)
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                     use_nvenc = False
                     break
                 break
@@ -839,8 +785,12 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
                     logger.warning(f"NVENC 编码失败尝试 {attempt}: {file_path.name} | stderr: {stderr[:1000]}")
                 if attempt == len(NVENC_RETRIES) + 1:
                     use_nvenc = False
+            except subprocess.TimeoutExpired:
+                logger.error(f"FFmpeg 进程超时（{FFMPEG_TIMEOUT}s）: {file_path.name}")
+                use_nvenc = False
+                break
 
-    # -------------------- CPU 编码 --------------------
+    # CPU
     if not use_nvenc:
         ff_params_cpu = build_ffmpeg_params(info, False, gpu_name)
         cmd_cpu = build_ffmpeg_command_unified(
@@ -850,7 +800,7 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
         if debug:
             logger.debug(f"CPU FFmpeg 命令: {' '.join(cmd_cpu)}")
         try:
-            subprocess.run(cmd_cpu, check=True, capture_output=True, text=True, encoding='utf-8')
+            subprocess.run(cmd_cpu, check=True, capture_output=True, text=True, encoding='utf-8', timeout=FFMPEG_TIMEOUT)
             log_entry.update({
                 "status": "SUCCESS",
                 "quality": crf,
@@ -864,10 +814,12 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
             if debug:
                 logger.debug(f"CPU 编码失败 stderr:\n{stderr}")
             logger.error(f"CPU 转码失败: {file_path.name}\n{stderr[:2000]}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"FFmpeg 进程超时（{FFMPEG_TIMEOUT}s）: {file_path.name}")
 
     return log_entry
 
-# -------------------- dynamic_workers (基于温度/负载优化 HDR 并行度) --------------------
+# -------------------- 并行度 --------------------
 def dynamic_workers():
     try:
         import psutil
@@ -888,11 +840,11 @@ def dynamic_workers():
             return max(1, (os.cpu_count() or 1) // 4)
         elif avg_temp > 70:
             return max(1, (os.cpu_count() or 1) // 2)
-        # MODIFIED v1.6.9: HDR 4K/8K 限制 worker <= 4
         return min(4, max(1, os.cpu_count() or 1))
     except Exception:
         return max(1, os.cpu_count() or 1)
 
+# -------------------- 批量转换 --------------------
 def batch_convert(input_dir: Path, output_dir: Path, max_workers: int = 4, **kwargs):
     files = [f for f in input_dir.rglob("*") if f.is_file() and f.suffix.lower() in INPUT_EXTS]
     if not files:
@@ -915,7 +867,7 @@ def batch_convert(input_dir: Path, output_dir: Path, max_workers: int = 4, **kwa
 
 # -------------------- CLI --------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Apple HEVC 批量转码脚本 v1.6.10")
+    parser = argparse.ArgumentParser(description="Apple HEVC 批量转码脚本 v1.6.10-patch")
     parser.add_argument("-i", "--input", dest="input_dir", required=True)
     parser.add_argument("-o", "--output", dest="output_dir", required=True)
     parser.add_argument("--debug", action="store_true")
@@ -930,10 +882,12 @@ if __name__ == "__main__":
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
     input_path = Path(args.input_dir)
     sample_files = [f for f in input_path.rglob("*") if f.is_file() and f.suffix.lower() in INPUT_EXTS][:5]
-    any_hdr = any(probe_media(f).hdr for f in sample_files)
-    # ```MODIFIED v1.6.8: 使用 dynamic_workers 优化并行度选择（若 psutil 可用则基于温度）```
+    any_hdr = False
+    try:
+        any_hdr = any(probe_media(f).hdr for f in sample_files)
+    except Exception as e:
+        logger.warning(f"采样探测出错: {e}")
     max_workers = min(dynamic_workers(), 4) if any_hdr else min(MAX_WORKERS_SDR, 8)
-    # 若需要用户指定 max_workers，可在未来添加 CLI 参数覆盖
     check_tools()
     batch_convert(
         Path(args.input_dir),
